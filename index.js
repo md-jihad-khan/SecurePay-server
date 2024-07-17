@@ -46,6 +46,7 @@ async function run() {
       try {
         const decoded = jwt.verify(token.split(" ")[1], "your_jwt_secret");
         req.user = decoded;
+
         next();
       } catch (error) {
         res.status(400).send("Invalid token");
@@ -64,6 +65,7 @@ async function run() {
           mobileNumber: user.mobileNumber,
           role: user.role,
           balance: user.balance,
+          status: user.status,
         });
       } catch (error) {
         res.status(400).send(error.message);
@@ -109,57 +111,118 @@ async function run() {
 
     app.post("/api/auth/login", async (req, res) => {
       const { identifier, pin } = req.body;
+      const user = await db.collection("users").findOne({
+        $or: [{ mobileNumber: identifier }, { email: identifier }],
+      });
 
-      try {
-        // Find the user by mobile number or email
-        const user = await db.collection("users").findOne({
-          $or: [{ mobileNumber: identifier }, { email: identifier }],
-        });
+      if (!user) return res.status(400).send("User not found");
 
-        // If user not found, send error response
-        if (!user) {
-          return res.status(400).send("User not found");
-        }
+      const isMatch = await bcrypt.compare(pin, user.pin);
+      if (!isMatch) return res.status(400).send("Invalid PIN");
 
-        // Verify the provided pin with the stored hashed pin
-        const isMatch = await bcrypt.compare(pin, user.pin);
-        if (!isMatch) {
-          return res.status(400).send("Invalid PIN");
-        }
+      const token = jwt.sign(
+        { id: user._id, role: user.role }, // Include role in the payload
+        "your_jwt_secret",
+        { expiresIn: "1h" }
+      );
 
-        // Generate JWT token with user ID
-        const token = jwt.sign({ id: user._id }, "your_jwt_secret", {
-          expiresIn: "1h",
-        });
-
-        // Send success response with token
-        res.status(200).send({
-          message: "Login Successful",
-          token: token,
-        });
-      } catch (error) {
-        res.status(500).send("Server error");
-      }
+      res.status(200).send({
+        message: "Login Successful",
+        token: token,
+      });
     });
 
-    app.post("/api/admin/approve", async (req, res) => {
-      const { userId } = req.body;
-      try {
-        const user = await db
-          .collection("users")
-          .findOne({ _id: new ObjectID(userId) });
-        if (!user) return res.status(404).send("User not found");
-        await db
-          .collection("users")
-          .updateOne(
-            { _id: new ObjectID(userId) },
-            { $set: { status: "approved", balance: user.balance + 40 } }
-          );
-        res.status(200).send("User approved");
-      } catch (error) {
-        res.status(400).send(error.message);
+    const adminMiddleware = (req, res, next) => {
+      if (req.user.role !== "admin") {
+        return res.status(403).send("Access denied. Admins only.");
       }
-    });
+      next();
+    };
+
+    // Get all users
+    app.get(
+      "/api/admin/users",
+      [authMiddleware, adminMiddleware],
+      async (req, res) => {
+        try {
+          const users = await db
+            .collection("users")
+            .find({ role: { $ne: "admin" } })
+            .toArray();
+          res.status(200).send(users);
+        } catch (error) {
+          res.status(400).send(error.message);
+        }
+      }
+    );
+
+    // Search users by name
+    app.get(
+      "/api/admin/users/search",
+      [authMiddleware, adminMiddleware],
+      async (req, res) => {
+        const { name } = req.query;
+        try {
+          const users = await db
+            .collection("users")
+            .find({
+              name: { $regex: new RegExp(name, "i") },
+              role: { $ne: "admin" },
+            })
+            .toArray();
+          res.status(200).send(users);
+        } catch (error) {
+          res.status(400).send(error.message);
+        }
+      }
+    );
+
+    // Activate/Block user account
+    app.post(
+      "/api/admin/users/:id/status",
+      [authMiddleware, adminMiddleware],
+      async (req, res) => {
+        const { id } = req.params;
+        const { status } = req.body; // status can be 'active' or 'blocked'
+
+        try {
+          const user = await db
+            .collection("users")
+            .findOne({ _id: new ObjectId(id) });
+
+          if (!user) {
+            return res.status(404).send("User not found");
+          }
+
+          // Check if the user is being activated for the first time from a pending state
+          if (status === "active" && user.status === "pending") {
+            let bonus = 0;
+            if (user.role === "agent") {
+              bonus = 10000; // Bonus for agents
+            } else {
+              bonus = 40; // Bonus for normal users
+            }
+
+            await db.collection("users").updateOne(
+              { _id: new ObjectId(id) },
+              {
+                $set: { status },
+                $inc: { balance: bonus },
+              }
+            );
+          } else {
+            // Just update the status without changing the balance
+            await db
+              .collection("users")
+              .updateOne({ _id: new ObjectId(id) }, { $set: { status } });
+          }
+
+          res.status(200).send("User status updated successfully");
+        } catch (error) {
+          res.status(400).send(error.message);
+        }
+      }
+    );
 
     app.post("/api/user/send-money", authMiddleware, async (req, res) => {
       const { recipientMobile, amount } = req.body;
